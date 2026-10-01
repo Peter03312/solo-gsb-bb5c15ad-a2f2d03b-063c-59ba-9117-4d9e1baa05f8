@@ -281,7 +281,10 @@ class App:
             item = repository.get_item(self.conn(), int(parts[0]))
             if item is None:
                 raise LookupError("物品不存在")
-            return self.html(render.public_item(item, req.is_staff))
+            merge_info = None
+            if item["status"] == "merged":
+                merge_info = repository.get_merge_for_source_item(self.conn(), int(parts[0]))
+            return self.html(render.public_item(item, req.is_staff, merge_info))
 
         if m == "POST" and (parts := _match("/items/{id}/claims", p)):
             return self.submit_claim(req, int(parts[0]))
@@ -315,11 +318,28 @@ class App:
             item = repository.get_item(self.conn(), int(parts[0]))
             if item is None:
                 raise LookupError("物品不存在")
-            claims = repository.list_claims_for_item(self.conn(), int(parts[0]))
-            corrections = repository.list_corrections_for_item(self.conn(), int(parts[0]))
+            iid = int(parts[0])
+            claims = repository.list_claims_for_item(self.conn(), iid)
+            corrections = repository.list_corrections_for_item(self.conn(), iid)
+            merges_in = repository.list_merges_for_keep_item(self.conn(), iid)
+            merge_of = repository.get_merge_for_source_item(self.conn(), iid)
             return self.html(
-                render.staff_item_detail(item, claims, self.csrf_token(req), flash, corrections)
+                render.staff_item_detail(
+                    item, claims, self.csrf_token(req), flash, corrections,
+                    merges_in=merges_in, merge_of=merge_of,
+                )
             )
+
+        if p == "/staff/items/merge" and m == "GET":
+            preselect = req.query.get("item", "").strip()
+            preselect_id = int(preselect) if preselect.isdigit() else None
+            candidates = repository.list_mergeable_items(self.conn())
+            return self.html(
+                render.staff_merge_form(candidates, self.csrf_token(req), flash, preselect_id)
+            )
+
+        if p == "/staff/items/merge" and m == "POST":
+            return self.merge_items(req)
 
         if m == "POST" and (parts := _match("/staff/items/{id}/remove", p)):
             if not self.check_csrf(req):
@@ -431,6 +451,34 @@ class App:
         except ValueError as exc:
             return Response.redirect(f"/staff/claims/{claim_id}", ("err", str(exc)))
         return Response.redirect(f"/staff/claims/{claim_id}", ("ok", "已重发新交还码，旧码立即失效。"))
+
+    def merge_items(self, req: Request) -> Response:
+        if not self.check_csrf(req):
+            return self.bad_csrf()
+        form = req.form()
+        raw_keep = form.get("keep_item_id", "").strip()
+        raw_source = form.get("source_item_id", "").strip()
+        reason = form.get("reason", "").strip()
+        if not raw_keep.isdigit() or not raw_source.isdigit():
+            return Response.redirect("/staff/items/merge", ("err", "请选择有效的保留物品与并入物品。"))
+        keep_id, source_id = int(raw_keep), int(raw_source)
+        if keep_id == source_id:
+            return Response.redirect("/staff/items/merge", ("err", "保留物品与并入物品必须是两条不同的记录。"))
+        if not reason:
+            return Response.redirect(
+                f"/staff/items/merge?item={source_id}", ("err", "合并理由不能为空。")
+            )
+        if len(reason) > 2000:
+            return Response.redirect("/staff/items/merge", ("err", "合并理由超出长度限制。"))
+        try:
+            repository.merge_items(self.conn(), keep_id, source_id, reason)
+        except ValueError as exc:  # 业务冲突 / 并发落选：不改动任何状态
+            return Response.redirect(f"/staff/items/merge?item={source_id}", ("err", str(exc)))
+        return Response.redirect(
+            f"/staff/items/{keep_id}",
+            ("ok", f"已合并：物品 #{source_id} 的认领申请与改判记录已并入物品 #{keep_id}；"
+                   "原查询凭证继续可用，并入记录不再公开、不能恢复或再收申请。"),
+        )
 
     def rejudge_claim(self, req: Request, claim_id: int) -> Response:
         if not self.check_csrf(req):

@@ -64,6 +64,7 @@ h2{font-size:17px;margin:0 0 10px}
 .badge-pending{background:#fef9c3;color:#854d0e}
 .badge-removed,.badge-rejected{background:#fee2e2;color:var(--err)}
 .badge-returned{background:#dbeafe;color:#1d4ed8}
+.badge-merged{background:#ede9fe;color:#6d28d9}
 table{width:100%;border-collapse:collapse;font-size:14px}
 th,td{border-bottom:1px solid var(--line);padding:9px 8px;text-align:left;vertical-align:top}
 th{color:var(--muted);font-weight:600;font-size:12px}
@@ -161,10 +162,19 @@ def public_list(items: list[Any], staff: bool, flash: tuple[str, str] | None = N
     return page("保管中的失物", content, staff=staff, flash=flash)
 
 
-def public_item(item: Any, staff: bool) -> str:
+def public_item(item: Any, staff: bool, merge_info: Any = None) -> str:
     closed = item["status"] != "kept"
     notice = ""
-    if closed:
+    if item["status"] == "merged" and merge_info is not None:
+        # 旧详情指向保留物品；并入记录不接受新申请、不展示私密信息。
+        notice = (
+            '<div class="flash flash-info">该失物记录经核对为重复登记，'
+            '已并入保留记录，请查看 '
+            f'<a href="/items/{merge_info["keep_item_id"]}">'
+            f'物品 #{merge_info["keep_item_id"]} {e(merge_info["keep_public_description"])}</a>'
+            '。原查询凭证仍可在「查询认领进度」页查询本人申请，本记录不再接受新申请。</div>'
+        )
+    elif closed:
         notice = '<div class="flash flash-info">该物品已撤下或已交还，不再接受新的认领申请。</div>'
     form = (
         '<form method="post" action="/items/'
@@ -178,11 +188,18 @@ def public_item(item: Any, staff: bool) -> str:
         '<div class="row"><button class="btn" type="submit">提交认领</button>'
         '<a class="btn secondary" href="/">返回列表</a></div></form>'
     )
+    back = f'<a class="btn secondary" href="/">返回列表</a>'
+    if item["status"] == "merged" and merge_info is not None:
+        back = (
+            f'<a class="btn" href="/items/{merge_info["keep_item_id"]}">前往保留物品 '
+            f'#{merge_info["keep_item_id"]}</a>' + back
+        )
     body = (
         f'<div class="card"><h1>物品详情</h1>'
         f'<p style="font-size:16px">{e(item["public_description"])}</p>'
         f'<p class="muted">登记时间 {fmt_time(item["created_at"])} {item_badge(item["status"])}</p>'
-        f"{notice}{'' if not closed else ''}{form if not closed else ''}</div>"
+        f"{notice}{'' if not closed else ''}{form if not closed else ''}"
+        f'<div class="row">{back}</div></div>'
     )
     return page("物品详情", body, staff=staff)
 
@@ -254,7 +271,9 @@ def query_result(
                 '<p>现有交还码已使用、已过期或已被重发作废旧码，请联系工作人员重发新码。</p></div>'
             )
     elif status == "rejected":
-        if claim["item_status"] != "kept":
+        if claim["item_status"] == "merged":
+            tip = "该物品记录已与另一条重复登记合并；工作人员已选定其他获选人，本次申请未获选。"
+        elif claim["item_status"] != "kept":
             tip = "该物品已撤下或已交还。"
         else:
             tip = "工作人员已选定其他获选人，本次申请未获选。"
@@ -313,7 +332,11 @@ def staff_dashboard(items: list[Any], csrf_token: str) -> str:
     </div>
     <div class="card"><h1>当面交还</h1>
       <p class="muted">获选人出示一次性交还码后，到
-      <a href="/staff/verify">核销交还码</a>页面完成交还登记。</p></div>"""
+      <a href="/staff/verify">核销交还码</a>页面完成交还登记。</p></div>
+    <div class="card"><h1>重复记录合并</h1>
+      <p class="muted">同一件失物被误登记为两条记录时，可到
+      <a href="/staff/items/merge">合并重复记录</a>页面指定保留物品与并入物品并填写合并理由；
+      仅两条记录均仍在保管且不同、且不会产生双获选时允许合并。</p></div>"""
     return page("工作人员登记台", body, staff=True)
 
 
@@ -323,6 +346,9 @@ def staff_item_detail(
     csrf_token: str,
     flash: tuple[str, str] | None = None,
     corrections: list[Any] | None = None,
+    *,
+    merges_in: list[Any] | None = None,
+    merge_of: Any = None,
 ) -> str:
     actions = ""
     if item["status"] == "kept":
@@ -331,10 +357,23 @@ def staff_item_detail(
             'onsubmit="return confirm(\'撤下后该物品将不再接受新申请，待核对申请会被拒绝。确定？\')">'
             f'{csrf_field(csrf_token)}<button class="btn danger" type="submit">撤下物品</button></form>'
         )
+        actions += (
+            f'<a class="btn secondary" href="/staff/items/merge?item={item["id"]}">合并到其他重复记录</a>'
+        )
     elif item["status"] == "removed":
         actions = (
             f'<form method="post" action="/staff/items/{item["id"]}/restore">'
             f'{csrf_field(csrf_token)}<button class="btn secondary" type="submit">恢复为保管中</button></form>'
+        )
+    merged_notice = ""
+    if item["status"] == "merged" and merge_of is not None:
+        merged_notice = (
+            '<div class="flash flash-info">本记录为重复登记的并入物品，已并入保留记录 '
+            f'<a href="/staff/items/{merge_of["keep_item_id"]}">'
+            f'#{merge_of["keep_item_id"]} {e(merge_of["keep_public_description"])}</a>，'
+            "不能恢复，也不再接受新申请。"
+            f'<br>合并理由：{e(merge_of["reason"])}'
+            f"<br>合并时间：{fmt_time(merge_of['created_at'])}</div>"
         )
     rows = ""
     for c in claims:
@@ -347,11 +386,13 @@ def staff_item_detail(
             f"<td>{fmt_time(c['created_at'])}</td>"
             "</tr>"
         )
-    rows = rows or '<tr><td colspan="5" class="muted">暂无认领申请。</td></tr>'
+    rows = rows or '<tr><td colspan="5" class="muted">暂无认领申请（并入物品的申请已归到保留物品）。</td></tr>'
     corr_html = _corrections_card(corrections or [])
+    merges_html = _merges_card(merges_in or [])
     body = f"""
     <div class="card">
       <h1>物品 #{item['id']} {item_badge(item['status'])}</h1>
+      {merged_notice}
       <dl class="info">
         <dt>公开描述</dt><dd>{e(item['public_description'])}</dd>
         <dt>私密辨认特征</dt><dd><div class="private">{e(item['private_features'])}</div></dd>
@@ -363,7 +404,7 @@ def staff_item_detail(
       <h1>认领申请（含私密答案与联系方式，仅工作人员可见）</h1>
       <table><thead><tr><th>申请</th><th>状态</th><th>辨认答案</th><th>联系方式</th><th>提交时间</th></tr></thead>
       <tbody>{rows}</tbody></table>
-    </div>{corr_html}"""
+    </div>{corr_html}{merges_html}"""
     return page(f"物品 #{item['id']}", body, staff=True, flash=flash)
 
 
@@ -393,6 +434,81 @@ def _corrections_card(corrections: list[Any]) -> str:
       <th>新答案 / 联系方式</th><th>更正理由</th><th>改判时间</th></tr></thead>
       <tbody>{rows}</tbody></table>
     </div>"""
+
+
+def _merges_card(merges: list[Any]) -> str:
+    """保留物品收到的并入记录（工作人员追溯：原物品、理由、时间）。"""
+    if not merges:
+        return ""
+    rows = "".join(
+        "<tr>"
+        f'<td><a href="/staff/items/{m["source_item_id"]}">#{m["source_item_id"]}</a></td>'
+        f"<td>{e(_short(m['source_public_description']))}</td>"
+        f"<td>{e(_short(m['source_private_features']))}</td>"
+        f"<td>{e(m['reason'])}</td>"
+        f"<td>{fmt_time(m['created_at'])}</td>"
+        "</tr>"
+        for m in merges
+    )
+    return f"""
+    <div class="card">
+      <h1>重复记录合并记录（仅工作人员可见）</h1>
+      <table><thead><tr><th>并入物品</th><th>原公开描述</th><th>原私密特征</th>
+      <th>合并理由</th><th>合并时间</th></tr></thead>
+      <tbody>{rows}</tbody></table>
+    </div>"""
+
+
+def staff_merge_form(
+    candidates: list[Any],
+    csrf_token: str,
+    flash: tuple[str, str] | None = None,
+    preselect_source_id: int | None = None,
+) -> str:
+    if candidates:
+        other_ids = [c["id"] for c in candidates if c["id"] != preselect_source_id]
+        preselect_keep = other_ids[0] if other_ids else None
+
+        def _opt(c: Any, selected_id: int | None) -> str:
+            return (
+                f'<option value="{c["id"]}"{" selected" if c["id"] == selected_id else ""}>'
+                f'#{c["id"]} {e(_short(c["public_description"], 60))}'
+                f'（登记 {fmt_time(c["created_at"])}）</option>'
+            )
+
+        keep_options = "".join(_opt(c, preselect_keep) for c in candidates)
+        source_options = "".join(_opt(c, preselect_source_id) for c in candidates)
+        body = f"""
+    <div class="card">
+      <h1>合并重复失物记录</h1>
+      <p class="muted">仅当两条记录<strong>都仍在保管中且互不相同</strong>时允许合并。
+      若两条记录各有获选申请将被拒绝；合计仅一份获选时保留其交还码，其他待核对申请标记为未获选。
+      合并后原查询凭证仍可查询本人申请。</p>
+      <form method="post" action="/staff/items/merge">
+        {csrf_field(csrf_token)}
+        <label for="keep_item_id">保留物品（合并后保留此记录，申请归到它名下）</label>
+        <select id="keep_item_id" name="keep_item_id" required>{keep_options}</select>
+        <label for="source_item_id">并入物品（合并后从公开列表消失、不能恢复）</label>
+        <select id="source_item_id" name="source_item_id" required>{source_options}</select>
+        <label for="reason">合并理由（必填，将随合并记录保存供追溯）</label>
+        <textarea id="reason" name="reason" required maxlength="2000"
+          placeholder="例如：核对登记后确认是同一只黑色双肩包，第二条为重复录入"></textarea>
+        <div class="row"><button class="btn danger" type="submit"
+          onclick="return confirm('并入物品将从公开列表消失且不能恢复；其申请与改判记录归到保留物品。确定合并？')">
+          确认合并</button>
+        <a class="btn secondary" href="/staff">取消并返回登记台</a></div>
+      </form>
+      <p class="muted">合并为一次性操作：并入物品不能恢复、不再接受新申请；
+      系统会保存保留物品、原物品、合并理由与时间供工作人员追溯。</p>
+    </div>"""
+    else:
+        body = """
+    <div class="card">
+      <h1>合并重复失物记录</h1>
+      <p class="muted">没有另一条仍在保管中的物品可以合并（仅保管中、未被撤下/交还/合并的记录可参与）。</p>
+      <div class="row"><a class="btn secondary" href="/staff">返回登记台</a></div>
+    </div>"""
+    return page("合并重复记录", body, staff=True, flash=flash)
 
 
 def staff_claim_detail(

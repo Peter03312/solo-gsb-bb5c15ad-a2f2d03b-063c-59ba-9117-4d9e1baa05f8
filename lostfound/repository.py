@@ -8,7 +8,8 @@ from typing import Any
 from . import security
 from .db import immediate_tx
 # 状态中文标签（单一事实来源，模板也使用）
-ITEM_STATUS_LABELS = {"kept": "保管中", "removed": "已撤下", "returned": "已交还"}
+ITEM_STATUS_LABELS = {"kept": "保管中", "removed": "已撤下", "returned": "已交还",
+                      "merged": "已并入其他记录"}
 CLAIM_STATUS_LABELS = {"pending": "待核对", "selected": "已获选", "rejected": "未获选"}
 
 
@@ -83,6 +84,8 @@ def remove_item(conn: sqlite3.Connection, item_id: int) -> None:
             raise LookupError("物品不存在")
         if row["status"] == "returned":
             raise ValueError("该物品已交还，不能撤下")
+        if row["status"] == "merged":
+            raise ValueError("该物品已并入其他记录，不能撤下")
         conn.execute(
             "UPDATE items SET status = 'removed', updated_at = ? WHERE id = ? AND status = 'kept'",
             (ts, item_id),
@@ -117,6 +120,8 @@ def create_claim(
         ).fetchone()
         if row is None:
             raise LookupError("物品不存在")
+        if row["status"] == "merged":
+            raise ValueError("该物品记录已并入其他记录，不再接受新的认领申请")
         if row["status"] != "kept":
             raise ValueError("该物品已撤下或已交还，不再接受新的认领申请")
         blocked = conn.execute(
@@ -179,7 +184,7 @@ def select_claim(conn: sqlite3.Connection, claim_id: int, code_ttl_seconds: int,
         if row is None:
             raise LookupError("申请不存在")
         if row["item_status"] != "kept":
-            raise ValueError("物品已撤下或已交还，无法选定认领")
+            raise ValueError("物品已撤下、已交还或已并入其他记录，无法选定认领")
 
         cur = conn.execute(
             "UPDATE claims SET status = 'selected', decided_at = ?"
@@ -317,6 +322,140 @@ def list_corrections_for_item(conn: sqlite3.Connection, item_id: int) -> list[sq
         ORDER BY cr.id ASC
         """,
         (item_id,),
+    ).fetchall()
+
+
+# ----------------------------------------------------------------- 记录合并
+
+def merge_items(
+    conn: sqlite3.Connection,
+    keep_item_id: int,
+    source_item_id: int,
+    reason: str,
+) -> dict[str, int]:
+    """把误登记为两条的同一件失物合并：保留 keep、并入 source。
+
+    前置条件（任一不满足均拒绝，不改动任何状态）：
+      - 两条记录都存在、互不相同；
+      - 两条记录当前都处于 kept（仍在保管中，未撤下/未交还/未被合并）；
+      - 两条记录不能各有获选申请（否则会产生双获选）；
+      - 合并理由非空。
+
+    单次 IMMEDIATE 事务内完成（与选定、改判、撤下、核码等并发写互斥，
+    各操作均按提交时的最新状态重新核对）：
+      - 合计仅一份获选时：保留其交还码，将另一条上的其他待核对申请标记未获选；
+      - 两份均无获选时：所有待核对申请保持待核对；
+      - 并入物品的认领申请与改判记录归到保留物品；
+      - 并入物品标记为 merged 并指向保留物品，从此不能恢复、不再接受新申请。
+    返回 {'keep_item_id': ..., 'source_item_id': ...}。
+    """
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError("合并理由不能为空")
+    if keep_item_id == source_item_id:
+        raise ValueError("保留物品与并入物品必须是两条不同的记录")
+
+    ts = now_iso()
+    with immediate_tx(conn):
+        keep = conn.execute(
+            "SELECT id, status FROM items WHERE id = ?", (keep_item_id,)
+        ).fetchone()
+        if keep is None:
+            raise LookupError("保留物品不存在")
+        source = conn.execute(
+            "SELECT id, status FROM items WHERE id = ?", (source_item_id,)
+        ).fetchone()
+        if source is None:
+            raise LookupError("并入物品不存在")
+        if keep["status"] != "kept" or source["status"] != "kept":
+            raise ValueError("两条记录都必须仍在保管中（未撤下、未交还、未被合并）才能合并")
+
+        keep_selected = conn.execute(
+            "SELECT COUNT(*) AS n FROM claims WHERE item_id = ? AND status = 'selected'",
+            (keep_item_id,),
+        ).fetchone()["n"]
+        source_selected = conn.execute(
+            "SELECT COUNT(*) AS n FROM claims WHERE item_id = ? AND status = 'selected'",
+            (source_item_id,),
+        ).fetchone()["n"]
+        if keep_selected and source_selected:
+            raise ValueError("两条记录各有获选申请，不能合并（会产生双获选）")
+
+        # 合计仅一份获选：获选申请及其交还码原样保留，其余待核对申请标记未获选。
+        if keep_selected or source_selected:
+            conn.execute(
+                "UPDATE claims SET status = 'rejected', decided_at = ?"
+                " WHERE item_id IN (?, ?) AND status = 'pending'",
+                (ts, keep_item_id, source_item_id),
+            )
+
+        # 并入物品的申请（含其全部交还码，经 claim_id 关联自动跟随）归到保留物品。
+        moved = conn.execute(
+            "UPDATE claims SET item_id = ? WHERE item_id = ?",
+            (keep_item_id, source_item_id),
+        )
+        # 并入物品的改判记录同样归到保留物品，保证更正链条可继续追溯。
+        conn.execute(
+            "UPDATE corrections SET item_id = ? WHERE item_id = ?",
+            (keep_item_id, source_item_id),
+        )
+
+        cur = conn.execute(
+            "UPDATE items SET status = 'merged', merged_into_item_id = ?, updated_at = ?"
+            " WHERE id = ? AND status = 'kept'",
+            (keep_item_id, ts, source_item_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("并入物品状态已变化（可能已被并发处理），合并未执行")
+        conn.execute(
+            "UPDATE items SET updated_at = ? WHERE id = ? AND status = 'kept'",
+            (ts, keep_item_id),
+        )
+        conn.execute(
+            "INSERT INTO item_merges (keep_item_id, source_item_id, reason, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (keep_item_id, source_item_id, reason, ts),
+        )
+    return {"keep_item_id": keep_item_id, "source_item_id": source_item_id, "moved_claims": moved.rowcount}
+
+
+def list_merges_for_keep_item(conn: sqlite3.Connection, item_id: int) -> list[sqlite3.Row]:
+    """保留物品收到的合并记录（工作人员追溯），含并入物品的原描述。"""
+    return conn.execute(
+        """
+        SELECT m.*,
+               si.public_description AS source_public_description,
+               si.private_features   AS source_private_features,
+               si.created_at         AS source_created_at
+        FROM item_merges m
+        JOIN items si ON si.id = m.source_item_id
+        WHERE m.keep_item_id = ?
+        ORDER BY m.id ASC
+        """,
+        (item_id,),
+    ).fetchall()
+
+
+def get_merge_for_source_item(conn: sqlite3.Connection, item_id: int) -> sqlite3.Row | None:
+    """并入物品对应的合并记录（旧详情指向保留物品时使用）。"""
+    return conn.execute(
+        """
+        SELECT m.*,
+               ki.public_description AS keep_public_description,
+               ki.status             AS keep_status
+        FROM item_merges m
+        JOIN items ki ON ki.id = m.keep_item_id
+        WHERE m.source_item_id = ?
+        """,
+        (item_id,),
+    ).fetchone()
+
+
+def list_mergeable_items(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """可被选为合并对象的保管中物品（合并表单下拉）。"""
+    return conn.execute(
+        "SELECT id, public_description, created_at FROM items"
+        " WHERE status = 'kept' ORDER BY id DESC"
     ).fetchall()
 
 
