@@ -6,11 +6,13 @@ CREATE TABLE IF NOT EXISTS items (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     public_description TEXT    NOT NULL,
     private_features   TEXT    NOT NULL,
-    -- kept=保管中  removed=已撤下  returned=已交还
+    -- kept=保管中  removed=已撤下  returned=已交还  merged=已并入另一条记录
     status             TEXT    NOT NULL DEFAULT 'kept'
-                         CHECK (status IN ('kept', 'removed', 'returned')),
+                         CHECK (status IN ('kept', 'removed', 'returned', 'merged')),
     created_at         TEXT    NOT NULL,
-    updated_at         TEXT    NOT NULL
+    updated_at         TEXT    NOT NULL,
+    -- status='merged' 时指向保留物品；其余状态为 NULL
+    merged_into_id     INTEGER REFERENCES items(id)
 );
 
 -- 认领申请：token_hash 存放查询凭证的 SHA-256，凭证明文只出现一次。
@@ -54,3 +56,16 @@ CREATE TABLE IF NOT EXISTS corrections (
     created_at    TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_corrections_item ON corrections(item_id);
+
+-- 物品合并记录：同一件失物被误登记为两条记录时，工作人员指定保留物品与
+-- 并入物品并填写理由。并入物品的全部申请与改判记录原子地归到保留物品，
+-- 并入物品状态变为 merged、不再公开、不能恢复也不再接受申请。
+CREATE TABLE IF NOT EXISTS merges (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    keep_item_id     INTEGER NOT NULL REFERENCES items(id),  -- 保留物品
+    merged_item_id   INTEGER NOT NULL REFERENCES items(id),  -- 并入物品（合并后 merged）
+    reason           TEXT    NOT NULL,
+    created_at       TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_merges_keep ON merges(keep_item_id);
+CREATE INDEX IF NOT EXISTS idx_merges_merged ON merges(merged_item_id);

@@ -281,6 +281,9 @@ class App:
             item = repository.get_item(self.conn(), int(parts[0]))
             if item is None:
                 raise LookupError("物品不存在")
+            if item["status"] == "merged" and item["merged_into_id"] is not None:
+                # 并入物品的旧详情地址永久指向保留物品（公开页）
+                return Response.redirect(f"/items/{item['merged_into_id']}")
             return self.html(render.public_item(item, req.is_staff))
 
         if m == "POST" and (parts := _match("/items/{id}/claims", p)):
@@ -315,11 +318,33 @@ class App:
             item = repository.get_item(self.conn(), int(parts[0]))
             if item is None:
                 raise LookupError("物品不存在")
-            claims = repository.list_claims_for_item(self.conn(), int(parts[0]))
-            corrections = repository.list_corrections_for_item(self.conn(), int(parts[0]))
-            return self.html(
-                render.staff_item_detail(item, claims, self.csrf_token(req), flash, corrections)
+            iid = int(parts[0])
+            # 已并入物品的申请与改判记录均已归到保留物品：旧详情展示归并后的数据
+            view_item_id = (
+                item["merged_into_id"]
+                if item["status"] == "merged" and item["merged_into_id"] is not None
+                else iid
             )
+            claims = repository.list_claims_for_item(self.conn(), view_item_id)
+            corrections = repository.list_corrections_for_item(self.conn(), view_item_id)
+            merges = repository.list_merges_for_item(self.conn(), iid)
+            merge_info = None
+            merge_candidates = []
+            if item["status"] == "merged":
+                merge_info = repository.get_merge_for_merged(self.conn(), iid)
+            elif item["status"] == "kept":
+                merge_candidates = repository.list_mergeable_items(self.conn(), iid)
+            return self.html(
+                render.staff_item_detail(
+                    item, claims, self.csrf_token(req), flash, corrections,
+                    merge_candidates=merge_candidates,
+                    merges=merges,
+                    merge_info=merge_info,
+                )
+            )
+
+        if m == "POST" and (parts := _match("/staff/items/{id}/merge", p)):
+            return self.merge_items(req, int(parts[0]))
 
         if m == "POST" and (parts := _match("/staff/items/{id}/remove", p)):
             if not self.check_csrf(req):
@@ -397,6 +422,38 @@ class App:
             raise ValueError("填写内容超出长度限制。")
         item_id = repository.create_item(self.conn(), public_desc, private_features)
         return Response.redirect(f"/staff/items/{item_id}", ("ok", f"物品 #{item_id} 已登记。"))
+
+    def merge_items(self, req: Request, keep_item_id: int) -> Response:
+        if not self.check_csrf(req):
+            return self.bad_csrf()
+        form = req.form()
+        raw_target = form.get("merged_item_id", "").strip()
+        reason = form.get("reason", "").strip()
+        if not raw_target.isdigit():
+            return Response.redirect(f"/staff/items/{keep_item_id}", ("err", "请选择有效的并入物品。"))
+        if not reason:
+            return Response.redirect(f"/staff/items/{keep_item_id}", ("err", "合并理由不能为空。"))
+        if len(reason) > 2000:
+            return Response.redirect(f"/staff/items/{keep_item_id}", ("err", "合并理由超出长度限制。"))
+        merged_item_id = int(raw_target)
+        if merged_item_id == keep_item_id:
+            return Response.redirect(
+                f"/staff/items/{keep_item_id}",
+                ("err", "保留物品与并入物品必须是两条不同的记录。"),
+            )
+        try:
+            result = repository.merge_items(self.conn(), keep_item_id, merged_item_id, reason)
+        except (ValueError, LookupError) as exc:  # 提交时状态不满足：拒绝且不改动数据
+            return Response.redirect(f"/staff/items/{keep_item_id}", ("err", str(exc)))
+        winner = result["selected_claim_id"]
+        if winner is None:
+            msg = (f"已合并：物品 #{merged_item_id} 的申请与改判记录已归入本条（物品 #{keep_item_id}），"
+                   "并入记录已从公开列表移除且不能恢复；两条记录均暂无获选人。")
+        else:
+            msg = (f"已合并：物品 #{merged_item_id} 的申请与改判记录已归入本条（物品 #{keep_item_id}），"
+                   f"保留申请 #{winner} 的获选资格与交还码，其余待核对申请已标记未获选；"
+                   "并入记录已从公开列表移除且不能恢复。")
+        return Response.redirect(f"/staff/items/{keep_item_id}", ("ok", msg))
 
     def staff_claim(self, req: Request, claim_id: int, flash: Flash | None) -> Response:
         claim = repository.get_claim_with_context(self.conn(), claim_id)
